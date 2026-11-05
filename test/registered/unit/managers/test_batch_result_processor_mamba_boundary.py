@@ -345,9 +345,9 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 batch.tree_cache = SimpleNamespace(
                     page_size=TRACK_INTERVAL,
                     supports_mamba=lambda: True,
-                    evict_for_alloc=lambda params: (
-                        evicted.append(params.mamba_num),
-                        free_slots.extend([True] * params.mamba_num),
+                    evict_for_alloc=lambda demand: (
+                        evicted.append(demand.state_slots),
+                        free_slots.extend([True] * demand.state_slots),
                     ),
                 )
                 if spec:

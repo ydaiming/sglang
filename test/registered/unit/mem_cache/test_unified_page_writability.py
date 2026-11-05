@@ -4,10 +4,8 @@ A page's hazards (unfinished work that may still touch it) are recorded when
 it is freed or vacated; whoever writes it next waits only what its own
 ordering does not already imply (`page_usage.CLEARANCE`). Every path that hands
 out a page goes through `Band.acquire`, every path that returns one through
-`Band.release`, and a float's on-demand moves (`make_room`, `compact_holes`)
-clear their destinations the same way. Events here are host-controlled
-stand-ins, and stream waits are recorded instead of issued, so the tests run on
-the CPU.
+`Band.release`. Events here are host-controlled stand-ins, and stream waits are
+recorded instead of issued, so the tests run on the CPU.
 """
 
 import dataclasses
@@ -361,6 +359,37 @@ class TestFreedSlotCompactedInto(_Bands):
         self.assertNotIn(page, full._free_pages_snapshot())
 
 
+class TestRelocationHoles(_Bands):
+    def test_holes_a_relocation_creates_keep_their_fences(self):
+        """BUG REGRESSION. A relocation handed the pages of its new block
+        that it did not copy into to the free list unchecked, so a take could
+        overwrite bytes a neighbour vacated while a forward still read them.
+        The fences stay on those holes, and the take that writes one clears
+        it; the hole list is marked for the boundary absorb."""
+        alloc = _chain()
+        flt = alloc.swa_attn_allocator
+        ids = alloc.alloc(12)
+        self.assertIsNotNone(ids)
+        low, high = flt.low_wm_page, flt.high_wm_page
+        gap_low, _ = flt._gap_pages()
+        self.assertGreater(gap_low, 0, "the geometry left no low gap")
+        reader = _Event()
+        full = alloc.full_attn_allocator
+        alloc.set_latest_forward_done_event(reader)
+        # A neighbour's page there was vacated while the forward still reads it.
+        full.usage.vacate(reader, [(low - 1, low)], page_bytes=flt.entry_bytes_per_page)
+        flt._holes_dirty = False
+        self.assertEqual(flt.relocate_into(low - 1, high), 0)
+        self.assertEqual(self.waits.keys, [])
+        self.assertTrue(flt._holes_dirty)
+        self.assertIn(low - 1, flt._free_pages_snapshot())
+        # A forward's take (zeroed on hand-out) must not overwrite the bytes.
+        holes = len(flt._free_pages_snapshot())
+        pages = flt.acquire(holes, C.FORWARD).tolist()
+        self.assertIn(low - 1, pages)
+        self.assertEqual(self.waits.keys, [reader])
+
+
 class TestWidenedPagesUnderDcp(_Bands):
     """BUG REGRESSION. Under decode context parallelism the alloc surface
     hands out widened ids, `dcp_size` per physical row. A forward's write set
@@ -412,74 +441,6 @@ class TestWidenedPagesUnderDcp(_Bands):
                 set((ids // full.page_size).tolist()),
             )
             self.assertEqual(len(full._forward_written_pages()), 4)
-
-
-class TestFloatMoves(_Bands):
-    """A window float moves its pages only on demand (`make_room`,
-    `compact_holes`). The copy writes holes and gap pages, which unfinished
-    work may still touch, and leaves pages a forward may still read."""
-
-    def _float_with_a_recent_hole(self, rank=1):
-        """A float whose ``rank``-th lowest page was freed while a forward
-        that writes it runs: a hole inside the span, below the sources a
-        high-side ask moves."""
-        alloc = _chain()
-        flt = alloc.swa_attn_allocator
-        ids = alloc.alloc(8)
-        pages = flt.ids.virtual_to_physical[ids].tolist()
-        low = sorted(pages)[rank]
-        slot = ids[pages.index(low) : pages.index(low) + 1]
-        forward, page = self._overlapped_free(alloc, flt, slot, slot)
-        alloc.free_swa(slot)
-        return alloc, flt, forward, page
-
-    def test_a_copy_into_a_hole_a_running_forward_writes_waits_it(self):
-        alloc, flt, forward, page = self._float_with_a_recent_hole()
-        _, gap_high = flt._gap_pages()
-        epp = flt.entry_bytes_per_page
-        moved_into = []
-        real = flt._move_pages_and_rebind
-
-        def record(src, dst):
-            moved_into.extend(dst.tolist())
-            return real(src, dst)
-
-        with mock.patch.object(flt, "_move_pages_and_rebind", side_effect=record):
-            opened = flt.make_room(side="high", min_bytes=(gap_high + 1) * epp)
-        self.assertGreaterEqual(opened, (gap_high + 1) * epp)
-        self.assertIn(page, moved_into, "the geometry copied into no hole")
-        self.assertEqual(self.waits.keys, [forward])
-        self.assertFalse(alloc.verify_byte_accounting())
-
-    def test_a_move_waits_no_forward_that_only_reads_its_sources(self):
-        """The copy waits only a forward that writes a page it moves; the
-        pages it vacates are fenced, and a later copy into them waits."""
-        alloc = _chain()
-        flt = alloc.swa_attn_allocator
-        alloc.alloc(8)
-        reader = _Event()
-        alloc.set_latest_forward_done_event(reader)
-        low, high = flt.low_wm_page, flt.high_wm_page
-        _, gap_high = flt._gap_pages()
-        epp = flt.entry_bytes_per_page
-        flt.make_room(side="high", min_bytes=(gap_high + 1) * epp)
-        self.assertEqual(self.waits.keys, [])
-        self.assertLess(flt.high_wm_page, high)
-        vacated = range(max(flt.high_wm_page, low), high)
-        self.assertTrue(vacated, "the geometry vacated no page")
-        flt._wait_fences(vacated[0], vacated[-1] + 1)
-        self.assertEqual(self.waits.keys, [reader])
-
-    def test_an_interior_shift_waits_every_running_forward(self):
-        """Packing that copies into sources vacated earlier in the same pass
-        orders every copy after the running forwards."""
-        # The two pages below the hole shift up by one: the lower one is
-        # copied into the page the upper one just left.
-        alloc, flt, forward, _ = self._float_with_a_recent_hole(rank=2)
-        self.assertEqual(flt.compact_holes(retreat_side="low"), 2)
-        self.assertIn(forward, self.waits.keys)
-        self.assertEqual(flt._hole_pages(), 0)
-        self.assertFalse(alloc.verify_byte_accounting())
 
 
 class TestForwardTakes(_Bands):
@@ -673,6 +634,20 @@ class TestReservationRelease(_Bands):
         self.assertEqual(self.waits.keys, [])
         clearance = flt._range_clearance(pages[0], pages[0] + 1, (C.FORWARD,))
         self.assertEqual([key.events for key in clearance.stream], [copy])
+
+
+class TestStateSlotsFusedTake(_Bands):
+    def test_frontier_slots_are_taken_and_bound_in_one_kernel(self):
+        """BUG REGRESSION. State slots lost the fused take-and-bind path."""
+        alloc = _chain()
+        real = band_module.alloc_bind_inplace
+        with mock.patch.object(
+            band_module, "alloc_bind_inplace", side_effect=real
+        ) as fused:
+            slots = alloc.alloc_state_slots(2)
+        self.assertEqual(fused.call_count, 1)
+        state = alloc.mamba_allocator
+        self.assertTrue(bool((state.ids.virtual_to_physical[slots] >= 0).all()))
 
 
 class TestEndBandsCompactLazily(CustomTestCase):

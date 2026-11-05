@@ -116,8 +116,8 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    EvictParams,
     TreeLock,
+    evictable_by_sub_pool,
     window_sub_pool_of,
 )
 from sglang.srt.mem_cache.common import (
@@ -134,6 +134,12 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv.alloc.demand import (
+    DEMAND_RULES,
+    DemandPurpose,
+    KVDemand,
+    StateSlots,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
 from sglang.srt.mem_cache.memory_pool import (
@@ -169,9 +175,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
-
-# The default window of a window payload: the scheduler's sliding window.
-_SCHEDULER_WINDOW = object()
 
 _is_npu = is_npu()
 
@@ -594,9 +597,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _uses_swa_reservation(self) -> bool:
-        return (
-            self._uses_swa_tail_prealloc()
-            or self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim()
+        """Whether the scheduler's window budget prices preallocations: with
+        tail preallocation, or when windows share the owner's bytes."""
+        from sglang.srt.mem_cache.capacity import windows_share_owner_memory
+
+        return self._uses_swa_tail_prealloc() or windows_share_owner_memory(
+            self.token_to_kv_pool_allocator
         )
 
     def _required_admission_tokens(
@@ -612,29 +618,73 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_reservation_fits(
         self,
-        full_tokens: int,
-        swa_tokens: int,
+        demand: KVDemand,
         *,
         full_allocatable_tokens: int,
-        swa_allocatable_tokens: Optional[int],
+        window_allocatable_tokens: Optional[Dict[str, int]],
     ) -> bool:
-        return self.token_to_kv_pool_allocator.prealloc_fits(
-            self.tree_cache,
-            full_tokens,
-            swa_tokens,
+        allocator = self.token_to_kv_pool_allocator
+        return allocator.prealloc_fits(
+            demand,
+            evictable=evictable_by_sub_pool(self.tree_cache, allocator),
             full_budget_tokens=full_allocatable_tokens,
-            swa_budget_tokens=swa_allocatable_tokens,
+            window_budget_tokens=window_allocatable_tokens,
         )
 
-    def _reclaim_swa_tail_capacity(
-        self, swa_tail_len: int, req_id: str, *, full_len: int = 0
-    ) -> Optional[str]:
+    def _admit_preallocation(
+        self,
+        req: Req,
+        admission: KVDemand,
+        *,
+        state_slots: int,
+        full_allocatable_tokens: int,
+        window_allocatable_tokens: Optional[Dict[str, int]],
+    ) -> bool:
+        """Admit ``req``'s preallocation and make its rows takeable: the
+        allocator reclaims whatever its admission credited."""
         allocator = self.token_to_kv_pool_allocator
-        page_size = allocator.page_size
-        shortfall = allocator.reclaim_for_prealloc(
+        full_len = pre_alloc_fill_len(req)
+        take = self._prealloc_demand(
+            req,
+            ceil_align(full_len, allocator.page_size),
+            reserved=False,
+            state_slots=state_slots,
+        )
+        from sglang.srt.mem_cache.capacity import admit_preallocation
+
+        return admit_preallocation(
             self.tree_cache,
-            ceil_align(full_len, page_size),
-            ceil_align(swa_tail_len, page_size),
+            allocator,
+            admission,
+            take,
+            evictable=evictable_by_sub_pool(self.tree_cache, allocator),
+            full_budget_tokens=full_allocatable_tokens,
+            window_budget_tokens=window_allocatable_tokens,
+        )
+
+    def _pending_state_slots(self, req: Req) -> int:
+        """State slots the preallocation takes for ``req`` beside its tokens:
+        its working state unless it already holds one, and the tracking slots
+        of the extra buffer."""
+        return self._state_slots(req, DemandPurpose.DECODE_PREALLOC)
+
+    def _state_slots(self, req: Req, purpose: DemandPurpose) -> int:
+        """The state slots ``purpose`` prices for ``req`` (`DEMAND_RULES`):
+        what a fresh request acquires, or what ``req`` still lacks."""
+        state = self.token_to_kv_pool_allocator.state
+        if state is None or not self.req_to_token_pool.holds_state_slots:
+            return 0
+        if DEMAND_RULES[purpose].state_slots is StateSlots.FRESH:
+            return state.fresh_request_slots(self.req_to_token_pool)
+        return state.pending_request_slots(self.req_to_token_pool, req)
+
+    def _reclaim_prealloc_capacity(
+        self, demand: KVDemand, req_id: str
+    ) -> Optional[str]:
+        from sglang.srt.mem_cache.capacity import reclaim_for_prealloc
+
+        shortfall = reclaim_for_prealloc(
+            self.tree_cache, self.token_to_kv_pool_allocator, demand
         )
         return None if shortfall is None else f"{shortfall}, req={req_id}"
 
@@ -657,52 +707,102 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _storage(self):
         return kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
-    def _swa_tail_len(self, seq_len: int, window_size: Optional[int] = None) -> int:
-        """The tokens of a window's tail a decode preallocation keeps: the
-        target window's, or a window of ``window_size`` tokens."""
-        if not self._uses_swa_tail_prealloc() or seq_len <= 0:
-            return max(seq_len, 0)
+    def _keep_insert_boundary(self) -> bool:
+        return get_disagg().disaggregation_decode_enable_radix_cache
 
-        if window_size is None:
-            window_size = self.scheduler.sliding_window_size
-        if window_size is None or window_size <= 0:
-            return seq_len
+    def _window_available_sizes(self) -> Dict[str, int]:
+        """Each window pool's free tokens, by name."""
+        allocator = self.token_to_kv_pool_allocator
+        return {
+            name: allocator.window_available_size(name)
+            for name in allocator.window_pool_names()
+        }
 
-        page_size = self.token_to_kv_pool_allocator.page_size
-        if get_disagg().disaggregation_decode_enable_radix_cache:
-            # Keep enough SWA before the page-aligned radix-cache insert
-            # boundary for the cached key to contain a complete window.
-            # `seq_len - 1` is the last committed position.
-            window_start = max(0, seq_len - 1 - max(window_size, page_size))
-        else:
-            window_start = max(0, seq_len - window_size)
-        window_start = (window_start // page_size) * page_size
-        return seq_len - window_start
+    def _window_evictable_sizes(self) -> Dict[str, int]:
+        """Each window pool's evictable tokens, by name."""
+        return {
+            name: self.tree_cache.window_evictable_size(name)
+            for name in self.token_to_kv_pool_allocator.window_pool_names()
+        }
 
-    def _swa_retractable_len(self, req: Req) -> int:
+    def _window_tails(self, seq_len: int) -> Dict[str, int]:
+        """The tail every window pool keeps of ``seq_len`` tokens, by name (the
+        storage's), or the whole sequence without tail preallocation."""
+        names = self.token_to_kv_pool_allocator.window_pool_names()
         if not self._uses_swa_tail_prealloc():
-            return len(req.origin_input_ids) + len(req.output_ids)
-        return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
+            return {name: max(seq_len, 0) for name in names}
+        tails = self._storage().window_tails(
+            seq_len, keep_insert_boundary=self._keep_insert_boundary()
+        )
+        return {name: tails.get(name, max(seq_len, 0)) for name in names}
 
-    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
-        allocated_kv_len = pre_alloc_fill_len(req)
+    def _prealloc_demand(
+        self,
+        req: Req,
+        full_tokens: int,
+        *,
+        reserved: bool,
+        state_slots: int = 0,
+        window_tokens: Optional[Dict[str, int]] = None,
+    ) -> KVDemand:
+        """A preallocation's demand naming every window, in whole pages. With
+        tail preallocation each window takes the tail it keeps of the request
+        (`_window_tails`), plus the decode reservation when ``reserved``;
+        without it a window keeps the whole sequence and takes what the owner
+        takes. ``window_tokens`` replaces the shares of the windows it names,
+        where the scheduler's window budgets price the request's growth."""
+        allocator = self.token_to_kv_pool_allocator
+        page_size = allocator.page_size
         if self._uses_swa_tail_prealloc():
-            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
-        return allocated_kv_len, allocated_kv_len
+            extra = 0
+            if reserved and not get_memory().disable_radix_cache:
+                extra = self.num_reserved_decode_tokens
+            windows = {
+                name: ceil_align(tail, page_size) + extra
+                for name, tail in self._window_tails(pre_alloc_fill_len(req)).items()
+            }
+        else:
+            windows = dict.fromkeys(allocator.window_pool_names(), full_tokens)
+        if window_tokens is not None:
+            windows.update(window_tokens)
+        return KVDemand(full_tokens, windows, state_slots)
 
-    def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
-        full_len, swa_len = self._prealloc_kv_lens(req)
+    def _window_retractable_lens(self, req: Req) -> Dict[str, int]:
+        """What retracting ``req`` frees in each window sub-pool, by name."""
+        if not self._uses_swa_tail_prealloc():
+            held = len(req.origin_input_ids) + len(req.output_ids)
+            return dict.fromkeys(
+                self.token_to_kv_pool_allocator.window_pool_names(), held
+            )
+        return {
+            name: tail + len(req.output_ids)
+            for name, tail in self._window_tails(len(req.origin_input_ids)).items()
+        }
+
+    def _running_window_retractable_tokens(self) -> Dict[str, int]:
+        total = dict.fromkeys(self.token_to_kv_pool_allocator.window_pool_names(), 0)
+        for req in self.scheduler.running_batch.reqs:
+            for name, tokens in self._window_retractable_lens(req).items():
+                total[name] += tokens
+        return total
+
+    def _prealloc_required(self, req: Req) -> Tuple[int, Dict[str, int]]:
+        """The tokens a preallocation of ``req`` needs: the owner's, and each
+        window sub-pool's tail by name, each in whole pages plus the decode
+        reservation."""
+        full_len = pre_alloc_fill_len(req)
+        windows = self._window_tails(full_len)
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size > 1:
-            # Match the allocator, which charges whole pages for both pools.
+            # Match the allocator, which charges whole pages for every pool.
             full_len = ceil_align(full_len, page_size)
-            swa_len = ceil_align(swa_len, page_size)
-        swa_reserved = self.num_reserved_decode_tokens
+            windows = {name: ceil_align(t, page_size) for name, t in windows.items()}
+        window_reserved = self.num_reserved_decode_tokens
         if get_memory().disable_radix_cache:
-            swa_reserved = 0
+            window_reserved = 0
         return (
             full_len + self.num_reserved_decode_tokens,
-            swa_len + swa_reserved,
+            {name: tokens + window_reserved for name, tokens in windows.items()},
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -984,7 +1084,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_prefix_len = None
         if self._uses_swa_tail_prealloc():
             fill_len = pre_alloc_fill_len(req)
-            max_prefix_len = fill_len - self._swa_tail_len(fill_len)
+            # Every window's tail, the longest included, is allocated afresh.
+            max_prefix_len = fill_len - max(
+                self._window_tails(fill_len).values(), default=fill_len
+            )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
         result = match_kv_cache(
@@ -1062,14 +1165,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         message = None
         allocator = self.token_to_kv_pool_allocator
-        full_required, swa_required = self._prealloc_required_tokens(req)
-        if not self._uses_swa_tail_prealloc():
-            swa_required = full_required
-        ceiling_fits = allocator.prealloc_ceiling_fits(full_required, swa_required)
+        full_required, _ = self._prealloc_required(req)
+        # A request no empty pool can give its tokens and its state slots
+        # together would wait in the queue forever.
+        demand = self._prealloc_demand(
+            req,
+            full_required,
+            reserved=True,
+            state_slots=self._state_slots(req, DemandPurpose.CEILING),
+        )
+        ceiling_fits = allocator.prealloc_ceiling_fits(demand)
         if ceiling_fits is False:
             message = (
-                f"Request {req.rid} exceeds the unified FULL/SWA KV byte "
-                f"budget: full={full_required}, swa={swa_required}"
+                f"Request {req.rid} exceeds the unified KV byte budget: "
+                f"full={full_required}, windows={dict(demand.window_tokens)}, "
+                f"state_slots={demand.state_slots}"
             )
         elif ceiling_fits is None:
             # HiSparse admits up to the host-backed logical capacity.
@@ -1082,13 +1192,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if input_len > capacity:
                 message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             elif self._uses_swa_tail_prealloc():
-                _, swa_required = self._prealloc_required_tokens(req)
+                _, window_required = self._prealloc_required(req)
                 swa_capacity = self.token_to_kv_pool_allocator.size_swa
-                if swa_required > swa_capacity:
-                    message = (
-                        f"Request {req.rid} requires too many SWA KV tokens for "
-                        f"decode preallocation: {swa_required} > {swa_capacity}"
-                    )
+                for name, required in window_required.items():
+                    if required > swa_capacity:
+                        message = (
+                            f"Request {req.rid} requires too many {name} KV tokens "
+                            f"for decode preallocation: {required} > {swa_capacity}"
+                        )
+                        break
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
@@ -1155,10 +1267,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # allocate memory
         resumed_reqs = []
-        swa_allocatable_tokens = None
+        window_allocatable_tokens = None
         if self._uses_swa_reservation():
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(count_retracted=False)
+            full_allocatable_tokens, window_allocatable_tokens = (
+                self._window_aware_allocatable_token_budgets(count_retracted=False)
             )
         else:
             full_allocatable_tokens = self._allocatable_token_budgets(
@@ -1180,22 +1292,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            full_required, swa_required = self._prealloc_required_tokens(req)
-            if not self._prealloc_reservation_fits(
-                full_required,
-                swa_required,
+            full_required, _ = self._prealloc_required(req)
+            state_slots = self._pending_state_slots(req)
+            if not self._admit_preallocation(
+                req,
+                self._prealloc_demand(
+                    req, full_required, reserved=True, state_slots=state_slots
+                ),
+                state_slots=state_slots,
                 full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=swa_allocatable_tokens,
+                window_allocatable_tokens=window_allocatable_tokens,
             ):
                 break
-
-            if self.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim():
-                full_len, swa_len = self._prealloc_kv_lens(req)
-                if (
-                    self._reclaim_swa_tail_capacity(swa_len, req.rid, full_len=full_len)
-                    is not None
-                ):
-                    break
 
             resumed_reqs.append(req)
             req.is_retracted = False
@@ -1204,8 +1312,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
             )
-            if swa_allocatable_tokens is not None:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+            if window_allocatable_tokens is not None:
+                window_allocatable_tokens = self._window_allocatable_token_budgets(
                     count_retracted=False,
                     extra_reserved_reqs=len(resumed_reqs),
                 )
@@ -1489,20 +1597,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        swa_allocatable_tokens = None
+        window_allocatable_tokens = None
         if self._uses_swa_reservation():
-            retractable_swa_tokens = sum(
-                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
-            )
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
+            retractable_window_tokens = self._running_window_retractable_tokens()
+            full_allocatable_tokens, window_allocatable_tokens = (
+                self._window_aware_allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=retractable_swa_tokens,
+                    retractable_window_tokens=retractable_window_tokens,
                     count_retracted=True,
                 )
             )
         else:
-            retractable_swa_tokens = 0
+            retractable_window_tokens = None
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
@@ -1666,9 +1772,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     hicache_reserved_tokens=reserved_restore_tokens,
                 )
                 if uses_swa_tail_prealloc:
-                    swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+                    window_allocatable_tokens = self._window_allocatable_token_budgets(
                         retractable_tokens=retractable_tokens,
-                        retractable_swa_tokens=retractable_swa_tokens,
+                        retractable_window_tokens=retractable_window_tokens,
                         count_retracted=True,
                         extra_reserved_reqs=num_device_preallocated,
                     )
@@ -1683,38 +1789,55 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_required_for_admission = self._required_admission_tokens(
                 decode_req.req, required_alloc_tokens, prefix_len, retractable_tokens
             )
-            swa_required_for_admission = 0
-            swa_len = required_alloc_tokens
+            window_admission_tokens = None
             if uses_swa_tail_prealloc:
-                _, swa_required = self._prealloc_required_tokens(decode_req.req)
-                _, swa_len = self._prealloc_kv_lens(decode_req.req)
+                _, window_required = self._prealloc_required(decode_req.req)
+                window_lens = self._window_tails(pre_alloc_fill_len(decode_req.req))
                 max_new_tokens = min(
                     decode_req.req.sampling_params.max_new_tokens,
                     CLIP_MAX_NEW_TOKEN,
                 )
-                swa_required_for_admission = max(
-                    swa_required,
-                    swa_len + max_new_tokens - retractable_swa_tokens,
-                )
-            elif swa_allocatable_tokens is not None:
-                swa_required_for_admission = full_required_for_admission
+                # Each window grows by the request's decode until it is full,
+                # as the scheduler's window budgets price it.
+                window_admission_tokens = {
+                    name: max(
+                        required,
+                        window_lens[name]
+                        + max_new_tokens
+                        - (retractable_window_tokens or {}).get(name, 0),
+                    )
+                    for name, required in window_required.items()
+                }
 
+            state_slots = self._pending_state_slots(decode_req.req)
             if not self._prealloc_reservation_fits(
-                full_required_for_admission,
-                swa_required_for_admission,
+                self._prealloc_demand(
+                    decode_req.req,
+                    full_required_for_admission,
+                    reserved=True,
+                    state_slots=state_slots,
+                    window_tokens=window_admission_tokens,
+                ),
                 full_allocatable_tokens=full_allocatable_tokens,
-                swa_allocatable_tokens=swa_allocatable_tokens,
+                window_allocatable_tokens=window_allocatable_tokens,
             ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
                 break
 
-            if swa_allocatable_tokens is not None:
-                reclaim_error = self._reclaim_swa_tail_capacity(
-                    swa_len,
+            if window_allocatable_tokens is not None:
+                reclaim_error = self._reclaim_prealloc_capacity(
+                    self._prealloc_demand(
+                        decode_req.req,
+                        ceil_align(
+                            required_alloc_tokens,
+                            self.token_to_kv_pool_allocator.page_size,
+                        ),
+                        reserved=False,
+                        state_slots=state_slots,
+                    ),
                     decode_req.req.rid,
-                    full_len=required_alloc_tokens,
                 )
                 if reclaim_error is not None:
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
@@ -1764,10 +1887,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 extra_reserved_reqs=num_device_preallocated + 1,
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
-            if swa_allocatable_tokens is not None:
-                swa_allocatable_tokens = self._swa_tail_allocatable_token_budget(
+            if window_allocatable_tokens is not None:
+                window_allocatable_tokens = self._window_allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=retractable_swa_tokens,
+                    retractable_window_tokens=retractable_window_tokens,
                     count_retracted=True,
                     extra_reserved_reqs=num_device_preallocated + 1,
                 )
@@ -1949,10 +2072,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             return [indices if non_blocking_metadata else indices.cpu().numpy()]
 
-        def _swa_payload(sub_pool=None, window=_SCHEDULER_WINDOW):
-            if window is _SCHEDULER_WINDOW:
-                # Read only when a window entry is sent.
-                window = self.scheduler.sliding_window_size
+        def _swa_payload(sub_pool=None):
             storage = kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
@@ -1963,7 +2083,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req,
                 token_start=total_prefix_len,
                 token_boundary=seq_len,
-                window=window,
             )
             return resume.unit_ids.cpu().numpy()
 
@@ -2044,8 +2163,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.req_to_token_pool, self.token_to_kv_pool_allocator
                     ),
                     StateType.AUXILIARY_SWA,
-                ),
-                None,
+                )
             ),
             StateType.DSA: _dsa_pages_payload,
             StateType.DSA_TAIL: _dsa_tail_payload,
@@ -2397,17 +2515,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             0,
             retractable_tokens,
         )
-        swa_required_tokens = 0
-        swa_allocatable_tokens = None
+        window_allocatable_tokens = None
         if self._uses_swa_reservation():
-            _, swa_required_tokens = self._prealloc_required_tokens(req)
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
+            full_allocatable_tokens, window_allocatable_tokens = (
+                self._window_aware_allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=sum(
-                        self._swa_retractable_len(r)
-                        for r in self.scheduler.running_batch.reqs
-                    ),
+                    retractable_window_tokens=self._running_window_retractable_tokens(),
                     count_retracted=True,
                 )
             )
@@ -2415,11 +2528,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
-        if not self._prealloc_reservation_fits(
-            required_tokens,
-            swa_required_tokens,
+        state_slots = self._pending_state_slots(req)
+        # The request's state slots are taken before its tokens: admission
+        # reclaims what it credited for both first.
+        if not self._admit_preallocation(
+            req,
+            self._prealloc_demand(
+                req, required_tokens, reserved=True, state_slots=state_slots
+            ),
+            state_slots=state_slots,
             full_allocatable_tokens=full_allocatable_tokens,
-            swa_allocatable_tokens=swa_allocatable_tokens,
+            window_allocatable_tokens=window_allocatable_tokens,
         ):
             return False
         self._pre_alloc(req)
@@ -2504,12 +2623,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             n_active = self._active_req_count(extra_reserved_reqs)
         return self.num_reserved_decode_tokens * n_active
 
-    def _swa_aware_allocatable_token_budgets(
+    def _window_aware_allocatable_token_budgets(
         self,
         retractable_tokens: Optional[int] = None,
-        retractable_swa_tokens: Optional[int] = None,
+        retractable_window_tokens: Optional[Dict[str, int]] = None,
         count_retracted: bool = True,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, Dict[str, int]]:
         n_active = self._active_req_count()
         reserved_tokens = self._active_reserved_tokens(n_active)
 
@@ -2519,9 +2638,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             reserved_tokens=reserved_tokens,
         )
 
-        return full_allocatable_tokens, self._swa_tail_allocatable_token_budget(
+        return full_allocatable_tokens, self._window_allocatable_token_budgets(
             retractable_tokens=retractable_tokens,
-            retractable_swa_tokens=retractable_swa_tokens,
+            retractable_window_tokens=retractable_window_tokens,
             count_retracted=count_retracted,
             n_active=n_active,
             reserved_tokens=reserved_tokens,
@@ -2577,86 +2696,94 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         if count_retracted:
             for req in self.retracted_queue:
-                full_required, _ = self._prealloc_required_tokens(req)
+                full_required, _ = self._prealloc_required(req)
                 allocatable_tokens -= full_required
 
         allocatable_tokens -= hicache_reserved_tokens
         return allocatable_tokens
 
-    def _swa_tail_allocatable_token_budget(
+    def _window_allocatable_token_budgets(
         self,
         retractable_tokens: Optional[int] = None,
-        retractable_swa_tokens: Optional[int] = None,
+        retractable_window_tokens: Optional[Dict[str, int]] = None,
         count_retracted: bool = True,
         n_active: Optional[int] = None,
         reserved_tokens: Optional[int] = None,
         extra_reserved_reqs: int = 0,
-    ) -> int:
-        need_swa_space_for_single_req = self._need_space_for_single_req(
-            retractable_tokens
-        )
-        if (
-            retractable_swa_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
-        ):
-            need_swa_space_for_single_req = max(
-                self._swa_tail_len(len(x.origin_input_ids))
-                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                - retractable_swa_tokens
-                for x in self.scheduler.running_batch.reqs
-            )
-
+    ) -> Dict[str, int]:
+        """What each window sub-pool has left for preallocations, by name, once
+        decode headroom and retraction are reserved: one rule for every
+        window, read with the window's own retained length and capacity."""
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(n_active)
-
-        # SWA growth is bounded by the sliding window: once a req's SWA
-        # footprint reaches `sliding_window_size`, further decode tokens
-        # evict old ones and net growth is zero. The linear reservation
-        # `num_reserved_decode_tokens * n_active` (correct for the full
-        # pool) over-reserves SWA in steady state. Cap by the actual
-        # remaining headroom up to per-req window cap.
-        window_size = self.scheduler.sliding_window_size or 0
         allocator = self.token_to_kv_pool_allocator
-        _, (swa_total, swa_available) = allocator.swa_capacity_and_available(
-            full_capacity=allocator.size_full, swa_capacity=allocator.size_swa
-        )
-        # Per-request SWA ring: cached prefixes still report swa_evictable, but
-        # evicting them frees no ring space.
-        swa_evictable = (
-            0
-            if is_swa_req_ring(self.token_to_kv_pool_allocator)
-            else self.tree_cache.window_evictable_size(window_sub_pool_of(allocator))
-        )
-        swa_used = swa_total - swa_available - swa_evictable
-        swa_growth_potential = max(0, n_active * window_size - swa_used)
-        swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
-        swa_allocatable_tokens = (
-            swa_available
-            + swa_evictable
-            - max(swa_reserved_tokens, need_swa_space_for_single_req)
-        )
-
-        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-        #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-        if (
-            self.scheduler.last_batch
+        retained = self._storage().retained_window_lengths()
+        running = self.scheduler.running_batch.reqs
+        prebuilt_n = (
+            len(self.scheduler.last_batch.reqs)
+            if self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
-        ):
-            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+            else 0
+        )
+        retracted_required = (
+            [self._prealloc_required(req)[1] for req in self.retracted_queue]
+            if count_retracted
+            else []
+        )
+        running_tails = (
+            [
+                (
+                    self._window_tails(len(x.origin_input_ids)),
+                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN),
+                )
+                for x in running
+            ]
+            if retractable_window_tokens is not None and running
+            else []
+        )
+        budgets = {}
+        for name in allocator.window_pool_names():
+            need_single_req = self._need_space_for_single_req(retractable_tokens)
+            if running_tails:
+                need_single_req = max(
+                    tails[name] + max_new - retractable_window_tokens[name]
+                    for tails, max_new in running_tails
+                )
+            # A window's growth is bounded by its retained length: once a
+            # request's footprint there reaches it, further decode tokens
+            # retire old ones and net growth is zero. The linear reservation
+            # `num_reserved_decode_tokens * n_active` (right for the owner)
+            # over-reserves a window in steady state, so cap it by the
+            # remaining headroom up to each request's window.
+            window_size = retained.get(name) or 0
+            total, available = allocator.window_capacity_and_available(name)
+            # Per-request window ring: cached prefixes still report evictable
+            # window tokens, but evicting them frees no ring space.
+            evictable = (
+                0
+                if is_swa_req_ring(allocator)
+                else self.tree_cache.window_evictable_size(name)
             )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
-            prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
-            swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
-
-        if count_retracted:
-            for req in self.retracted_queue:
-                _, swa_required = self._prealloc_required_tokens(req)
-                swa_allocatable_tokens -= swa_required
-
-        return swa_allocatable_tokens
+            used = total - available - evictable
+            growth_potential = max(0, n_active * window_size - used)
+            budget = (
+                available
+                + evictable
+                - max(min(reserved_tokens, growth_potential), need_single_req)
+            )
+            # If the last prebuilt extend just finished and `pop_preallocated`
+            # runs next, that batch is in no queue: count its slots here.
+            if prebuilt_n:
+                budget -= min(
+                    self.num_reserved_decode_tokens * prebuilt_n,
+                    max(0, prebuilt_n * window_size - used),
+                )
+            for required in retracted_required:
+                budget -= required[name]
+            budgets[name] = budget
+        return budgets
 
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -2674,21 +2801,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, allocator: BaseTokenToKVPoolAllocator, **kwargs
     ) -> torch.Tensor:
         storage = kv_storage_of(self.req_to_token_pool, allocator)
-        # Every window other than the target's (whose tail the scheduler's
-        # window gives) keeps its own tail, by the same rule: a fused draft's
-        # band retains its own length.
-        target = window_sub_pool_of(allocator)
-        stated_window_tails = {
-            name: (self._swa_tail_len(kwargs["fill_len"], window), component)
-            for name, (window, component) in storage.stated_window_lengths().items()
-            if name != target
-        }
         return alloc_for_decode_prealloc(
-            storage,
-            allocator,
-            stated_window_tails=stated_window_tails,
-            tree_cache=self.tree_cache,
-            **kwargs,
+            storage, allocator, tree_cache=self.tree_cache, **kwargs
         )
 
     def _transfer_page_indices(
@@ -2746,15 +2860,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             get_disagg().disaggregation_decode_enable_radix_cache
             and self._radix_full_available() < required_alloc_tokens
         ):
-            num_to_evict = required_alloc_tokens - self._radix_full_available()
             result = self.tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_to_evict)
+                KVDemand(full_tokens=required_alloc_tokens)
             )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
                     f"available {self._radix_full_available()} "
-                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
+                    f"after evicting {result.num_tokens_evicted} tokens. "
                     f"evictable_size={self._radix_full_evictable()}, "
                     f"protected_size={self._radix_full_protected()}, "
                     f"fill_len={fill_len}, prefix_len={prefix_len}, "
@@ -2765,20 +2878,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
-        swa_tail_len = self._swa_tail_len(fill_len)
+        window_tails = self._window_tails(fill_len)
         swa_pages_charged = (
             uses_swa_tail
             and not is_swa_req_ring(allocator)
             and not self.scheduler.enable_hisparse
         )
-        required_swa_tokens = (
-            ceil_align(swa_tail_len, allocator.page_size) if swa_pages_charged else 0
-        )
         if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
             # Admission includes evictable pages; allocation needs free pages.
             # Separate-pool resumes skip the caller's unified-only reclaim.
-            reclaim_error = self._reclaim_swa_tail_capacity(
-                swa_tail_len, req.rid, full_len=required_alloc_tokens
+            reclaim_error = self._reclaim_prealloc_capacity(
+                self._prealloc_demand(
+                    req,
+                    ceil_align(required_alloc_tokens, allocator.page_size),
+                    reserved=False,
+                ),
+                req.rid,
             )
             if reclaim_error is not None:
                 logger.warning("%s", reclaim_error)
@@ -2796,7 +2911,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 req=req,
                 fill_len=fill_len,
                 uses_swa_tail=uses_swa_tail,
-                swa_tail_len=swa_tail_len,
+                # HiSparse pools keep one window.
+                swa_tail_len=next(iter(window_tails.values()), fill_len),
             )
             # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
@@ -2816,7 +2932,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len=total_prefix_len,
                 prefix_indices=prefix_indices,
                 uses_swa_tail=uses_swa_tail,
-                swa_tail_len=swa_tail_len,
+                window_tails=window_tails,
                 req_to_token_pool=self.req_to_token_pool,
             )
         assert kv_loc is not None, (
@@ -2826,9 +2942,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
-            f"swa_evictable={self.tree_cache.window_evictable_size(window_sub_pool_of(allocator)) if swa_pages_charged else -1}, "
-            f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
+            f"window_available={self._window_available_sizes() if swa_pages_charged else -1}, "
+            f"window_evictable={self._window_evictable_sizes() if swa_pages_charged else -1}, "
+            f"window_tails={window_tails}, "
             f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
@@ -2913,15 +3029,13 @@ def alloc_for_decode_prealloc(
     total_prefix_len: int,
     prefix_indices: Optional[torch.Tensor],
     uses_swa_tail: bool,
-    swa_tail_len: int,
+    window_tails: Dict[str, int],
     req_to_token_pool: Optional[ReqToTokenPool] = None,
-    stated_window_tails: Optional[Dict[str, Tuple[int, str]]] = None,
     tree_cache=None,
 ) -> torch.Tensor:
-    """``stated_window_tails`` names, for each window with its own retention,
-    (tail tokens, tree component). ``tree_cache`` is the step's prefix cache,
-    for pools that need it."""
-    stated_window_tails = stated_window_tails or {}
+    """``window_tails`` names every window's live tail by window pool; with
+    ``uses_swa_tail`` each window binds only that tail of the new pages.
+    ``tree_cache`` is the step's prefix cache, for pools that need it."""
     req.kv.allocate_prealloc(fill_len)
     if allocator.page_size == 1:
         return storage.take_tokens(delta_len, make_room=_evicted_by_caller)
@@ -2941,7 +3055,8 @@ def alloc_for_decode_prealloc(
             total_prefix_len=total_prefix_len,
             last_loc=last_loc,
             uses_swa_tail=uses_swa_tail,
-            swa_tail_len=swa_tail_len,
+            # The NPU pool keeps one window.
+            swa_tail_len=next(iter(window_tails.values()), fill_len),
             req_to_token_pool=req_to_token_pool,
         )
     kv_loc = storage.take_extend(
@@ -2953,21 +3068,13 @@ def alloc_for_decode_prealloc(
         last_loc=last_loc,
         num_tokens=delta_len,
         make_room=_evicted_by_caller,
-        # Full-attention layers reuse prefix KV; SWA layers allocate only the
-        # live window tail.
-        window_tail=swa_tail_len if uses_swa_tail else None,
-        stated_window_tails=(
-            {name: tail for name, (tail, _) in stated_window_tails.items()}
-            if uses_swa_tail
-            else None
-        ),
+        # Full-attention layers reuse prefix KV; window layers allocate only
+        # the live tail of their own window.
+        window_tails=window_tails if uses_swa_tail else None,
         tree_cache=tree_cache,
     )
-    if uses_swa_tail:
-        tails = {window_sub_pool_of(allocator): swa_tail_len}
-        for name, (tail, _) in stated_window_tails.items():
-            tails[name] = tail
-        for name, tail in tails.items():
+    if uses_swa_tail and kv_loc is not None:
+        for name, tail in window_tails.items():
             evicted_seqlen = fill_len - tail
             assert evicted_seqlen >= 0 and evicted_seqlen % allocator.page_size == 0
             req.kv.set_evicted_seqlen(name, evicted_seqlen)

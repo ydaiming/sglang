@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import token_demand
 from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -104,8 +105,7 @@ _TOMBSTONE_METHODS = [
     (mea.Band, "_unbind_physical"),
     (mea.Band, "_commit_move_batch"),
     (mea.FloatBand, "free"),
-    (mea.FloatBand, "make_room"),
-    (mea.FloatBand, "_relocate_to_positions"),
+    (mea.FloatBand, "relocate_into"),
 ]
 
 
@@ -551,7 +551,10 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         cache.window_evictable_size.return_value = 0
         cache.evict_for_alloc.side_effect = AssertionError("no tree eviction needed")
 
-        self.assertTrue(alloc.evict_to_free_tokens(cache, before + 4, swa_num_tokens=0))
+        alloc.flush_deferred_full_frees()
+        self.assertTrue(
+            cache.reclaim(alloc.page_demands(token_demand(alloc, before + 4, 0)))
+        )
         self.assertEqual(alloc.full_available_size(), before + 8)
 
     def test_full_only_frees_defer_until_group_end(self):
@@ -681,10 +684,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())
-                self.assertEqual(
-                    a1.swa_attn_allocator.schedulable_available_size(),
-                    a2.swa_attn_allocator.schedulable_available_size(),
-                )
+                self.assertEqual(a1.swa_available_size(), a2.swa_available_size())
 
     def test_segment_frees_dispatch_no_data_dependent_shape(self):
         """Bug regression: the ratchet, a request's release and a tree eviction

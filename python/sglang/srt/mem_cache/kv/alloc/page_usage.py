@@ -702,6 +702,18 @@ class PageUsage:
             for use in self.uses
         )
 
+    def network_held_pending(self) -> Set[int]:
+        """Pending pages a network transfer still reads, until its logical
+        release: they return to the free list only after the release, so a
+        layout that does not need them treats them as occupied."""
+        held: Set[int] = set()
+        for use in self.uses:
+            if use.kind == VACATED and use.pages is not None:
+                keys = use.signal if isinstance(use.signal, tuple) else (use.signal,)
+                if any(isinstance(k, TransferRelease) and not k.released for k in keys):
+                    held.update(use.pages)
+        return held
+
     def has_fences(self) -> bool:
         return any(use.kind == VACATED and use.pages is None for use in self.uses)
 
