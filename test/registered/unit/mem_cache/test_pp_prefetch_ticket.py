@@ -41,6 +41,53 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
 
+class _TwoStageGroup:
+    """An all-gather between two simulated pipeline stages, one per thread."""
+
+    def __init__(self):
+        self.barrier = threading.Barrier(2, timeout=10)
+        self.slots = [None, None]
+
+    def all_gather(self, stage, obj):
+        self.slots[stage] = obj
+        self.barrier.wait()
+        gathered = list(self.slots)
+        self.barrier.wait()
+        return gathered
+
+
+class TestPrefetchAckSchema(unittest.TestCase):
+    def test_stages_with_different_pools_reduce_one_shape(self):
+        """BUG REGRESSION. A failed prefetch's ACK (no pool hits) was reduced
+        over the pool names a stage registers locally, so a stage holding a
+        window pool and one holding none entered one collective with tensors
+        of different lengths. Every stage now reduces one schema."""
+        group = _TwoStageGroup()
+        local_pools = ({"kv": None, "window_4096": None}, {"kv": None})
+        reduced = [None, None]
+
+        def stage(index):
+            c = HybridCacheController.__new__(HybridCacheController)
+            c.mem_pool_host = Mock(entry_map=local_pools[index])
+            c.prefetch_completion_sync_groups = [group]
+            c._ack_pool_schema = None
+            c._all_gather_object = lambda obj, g: g.all_gather(index, obj)
+            c._all_reduce = lambda tensor, op, groups: reduced.__setitem__(
+                index, tensor.shape
+            )
+            ack = PrefetchAck(rid="r", operation=None, pool_hits={})
+            c._reduce_prefetch_ack(ack)
+            return ack
+
+        threads = [threading.Thread(target=stage, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertIsNotNone(reduced[0])
+        self.assertEqual(reduced[0], reduced[1])
+
+
 class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
@@ -78,6 +125,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_backend = Mock()
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
+        c._ack_pool_schema = None
+        c._all_gather_object = Mock(side_effect=lambda obj, group: [obj])
         ranks = {"pp": [0, 2, 4, 6], "tp": [0, 1], "command": [0, 2, 4, 6]}
         patcher = patch.object(
             torch.distributed, "get_process_group_ranks", side_effect=ranks.__getitem__
