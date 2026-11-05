@@ -4387,6 +4387,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
         if self.chunked_req is not None:
