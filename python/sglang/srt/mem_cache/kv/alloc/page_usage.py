@@ -7,8 +7,10 @@ runs. Every move, reuse and write decision of the band reads this
 ledger: a copy waits the writers of its sources, a vacated page returns to the
 free list once its readers retired, and a write into vacated bytes outside the
 band waits their readers. Decisions read retirement (a forward the scheduler
-processed), never whether an event has fired, so every rank makes the same
-ones. A stream waits on the events themselves.
+processed, a transfer released where every rank sees it), never whether an
+event has fired, so every rank makes the same ones. A stream waits on the
+events themselves; a network transfer is waited for on the host
+(`signals.NetworkTransfer`).
 
 Whether a page may be written is one rule, `CLEARANCE`: what its next writer
 (a `Consumer`) must wait for, given each `Hazard` the ledger records on it. A
@@ -22,7 +24,9 @@ from typing import Dict, Hashable, List, Optional, Sequence, Set, Tuple
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.signals import (
+    ReceiveHold,
     StreamTransfer,
+    TransferRelease,
     keys_of,
     signal_fired,
 )
@@ -31,6 +35,9 @@ FORWARD = "forward"
 TRANSFER = "transfer"
 VACATED = "vacated"
 RECENT = "recent"
+
+# The keys of transfers, which are never a forward's event.
+_TRANSFER_KEYS = (StreamTransfer, TransferRelease)
 
 
 class Consumer(enum.Enum):
@@ -72,7 +79,7 @@ class Wait(enum.Enum):
     NONE = "none"
     # The consumer's stream waits the hazard's event (on the GPU).
     STREAM = "stream"
-    # The host waits until the network engine is done.
+    # The host waits until the network engine is done (`NetworkWaiter`).
     HOST = "host"
     # The consumer may start only once the hazard's forward retired: the page's
     # id must not reach a network peer before then.
@@ -176,9 +183,10 @@ def _owned(ids):
 class PageUse:
     """One use of a band's pages.
 
-    ``signal``: what a wait for the use to end waits for (a CUDA event, or a
-    tuple of them). ``ids``: controller ids translated to pages when read;
-    None for a forward whose writes are unknown. A vacated
+    ``signal``: what a wait for the use to end waits for (a CUDA event, a
+    network transfer, or a tuple of them). ``ids``: controller ids
+    translated to pages when read, or with ``unit_tokens`` physical units the
+    engine was handed; None for a forward whose writes are unknown. A vacated
     use holds byte range ``[lo, hi)``, and, when the pages return to this
     band's free list, their ids on the host and on the device (``pages``,
     ``batch``). A recent use holds, in ``batch``, device page ids freed while
@@ -190,6 +198,8 @@ class PageUse:
         "signal",
         "writes",
         "ids",
+        "unit_tokens",
+        "release",
         "lo",
         "hi",
         "pages",
@@ -203,6 +213,8 @@ class PageUse:
         *,
         writes: bool = False,
         ids=None,
+        unit_tokens: Optional[int] = None,
+        release: Optional[TransferRelease] = None,
         lo: int = 0,
         hi: int = 0,
         pages: Optional[List[int]] = None,
@@ -212,6 +224,8 @@ class PageUse:
         self.signal = signal
         self.writes = writes
         self.ids = ids
+        self.unit_tokens = unit_tokens
+        self.release = release
         self.lo = lo
         self.hi = hi
         self.pages = pages
@@ -251,19 +265,22 @@ class PageUsage:
         transfer's key, or a key holding one, is asked with `ended`."""
         if event is None:
             return True
-        if isinstance(event, (tuple, StreamTransfer)):
+        if isinstance(event, (tuple, *_TRANSFER_KEYS)):
             raise TypeError(f"not a forward's event: {event!r}")
         return self.event_seq.get(event, 0) <= self.retired_seq
 
     @staticmethod
-    def transfer_ended(key: StreamTransfer) -> bool:
-        """Whether a transfer still holds the decisions that read it: a copy
-        on a stream never does, since whatever writes its pages next waits
-        its events once the decision is made (the waits come after the
+    def transfer_ended(key) -> bool:
+        """Whether a transfer still holds the decisions that read it: a
+        host-observed transfer until it is released, where every rank sees it
+        end; a copy on a stream never, since whatever writes its pages next
+        waits its events once the decision is made (the waits come after the
         choice)."""
-        if not isinstance(key, StreamTransfer):
-            raise TypeError(f"not a transfer's key: {key!r}")
-        return True
+        if isinstance(key, TransferRelease):
+            return key.released
+        if isinstance(key, StreamTransfer):
+            return True
+        raise TypeError(f"not a transfer's key: {key!r}")
 
     def ended(self, key) -> bool:
         """Whether all the work behind a release ``key`` ended for the
@@ -272,7 +289,7 @@ class PageUsage:
         members; None holds nothing."""
         return all(
             self.transfer_ended(k)
-            if isinstance(k, StreamTransfer)
+            if isinstance(k, _TRANSFER_KEYS)
             else self.forward_retired(k)
             for k in keys_of(key)
         )
@@ -329,13 +346,32 @@ class PageUsage:
         elif ids is not None and ids.numel() > 0:
             self.uses.append(PageUse(FORWARD, event, writes=True, ids=_owned(ids)))
 
-    def record_transfer(self, signal, ids, *, writes: bool) -> None:
-        """Record a stream copy that ends with ``signal`` (an event, or a
-        tuple of them); its key is a `StreamTransfer`, never taken for a
-        forward's event."""
+    def record_transfer(
+        self,
+        signal,
+        ids,
+        *,
+        writes: bool,
+        release: Optional[TransferRelease],
+        unit_tokens: Optional[int],
+    ) -> None:
+        """Record a transfer that ends with ``signal``: a host-observed
+        transfer's release, or a stream copy's event (or tuple of events),
+        whose key is then a `StreamTransfer`, never taken for a forward's
+        event."""
         self.prune()
-        key = signal if isinstance(signal, StreamTransfer) else StreamTransfer(signal)
-        self.uses.append(PageUse(TRANSFER, key, writes=writes, ids=_owned(ids)))
+        if not isinstance(signal, _TRANSFER_KEYS):
+            signal = StreamTransfer(signal)
+        self.uses.append(
+            PageUse(
+                TRANSFER,
+                signal,
+                writes=writes,
+                ids=_owned(ids),
+                unit_tokens=unit_tokens,
+                release=release,
+            )
+        )
 
     def vacate(
         self,
@@ -454,8 +490,8 @@ class PageUsage:
     # -- reading --
 
     def prune(self) -> None:
-        """Drop forwards that retired, and transfers whose signal completed:
-        they only decided waits."""
+        """Drop forwards that retired, and transfers that were released or,
+        without a release, whose signal completed: they only decided waits."""
         self.uses = [use for use in self.uses if not self._ended(use)]
 
     def _ended(self, use: PageUse) -> bool:
@@ -466,6 +502,8 @@ class PageUsage:
         if use.kind == FORWARD:
             return self.forward_retired(use.signal)
         if use.kind == TRANSFER:
+            if use.release is not None:
+                return self.transfer_ended(use.release)
             return signal_fired(use.signal)
         return False
 
@@ -474,6 +512,15 @@ class PageUsage:
 
     def transfers(self) -> List[PageUse]:
         return [use for use in self.uses if use.kind == TRANSFER]
+
+    def holds_receive_rows(self) -> bool:
+        """Whether receive rows are held for a publish still to come."""
+        return any(
+            use.kind == TRANSFER
+            and isinstance(use.release, ReceiveHold)
+            and not use.release.released
+            for use in self.uses
+        )
 
     def writes_unknown(self) -> bool:
         return any(use.kind == FORWARD and use.ids is None for use in self.uses)
@@ -517,10 +564,13 @@ class PageUsage:
 
     def hazards(self, use: PageUse) -> List[Tuple[Hazard, object]]:
         """What a fence (a vacated byte range) still guards against, one entry
-        per key: a forward of this ledger, or a host copy."""
+        per key: a network transfer, a forward of this ledger, or a host
+        copy."""
         out = []
         for key in keys_of(use.signal):
-            if not isinstance(key, StreamTransfer):
+            if isinstance(key, TransferRelease):
+                out.append((Hazard.NETWORK, key))
+            elif not isinstance(key, StreamTransfer):
                 hazard = Hazard.FORWARD_WRITE if use.writes else Hazard.FORWARD_READ
                 out.append((hazard, key))
             else:
@@ -604,9 +654,10 @@ class PageUsage:
 
     def fences_need(self, lo: int, hi: int, consumers: Sequence[Consumer]) -> bool:
         """Whether a fence meeting bytes ``[lo, hi)`` holds an unretired forward
-        that one of ``consumers`` must clear; removes nothing. It picks which
-        pages a take prefers, so it reads retirement only, alike on every rank:
-        a host copy, which has no logical release, only ever adds a wait."""
+        or an unreleased network transfer that one of ``consumers`` must clear;
+        removes nothing. It picks which pages a take prefers, so it reads
+        retirement and releases only, alike on every rank: a host copy, which
+        has no logical release, only ever adds a wait."""
         for use in self.uses:
             if not (
                 use.kind == VACATED
@@ -618,7 +669,7 @@ class PageUsage:
             for hazard, key in self.hazards(use):
                 if hazard in (Hazard.COPY_READ, Hazard.COPY_WRITE):
                     continue
-                if not self.forward_retired(key) and must_wait(consumers, hazard):
+                if not self.ended(key) and must_wait(consumers, hazard):
                     return True
         return False
 

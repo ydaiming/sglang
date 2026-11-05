@@ -61,12 +61,6 @@ def float_chain(allocator) -> FloatChain:
     return FloatChain(owner=roles.owner, window=roles.window, state=roles.state)
 
 
-def pin_every_band(allocator, busy) -> None:
-    """Register ``busy`` as a pin source over every band of a chain allocator,
-    as PD and HiCache register theirs over every sub-pool."""
-    allocator.add_pin_source(tuple(m.sub_pool_name for m in allocator.members), busy)
-
-
 HOLD = "test-hold"
 
 
@@ -81,6 +75,16 @@ def hold_band(band, key=HOLD) -> None:
 
 def release_band(band, key=HOLD) -> None:
     band.unfix_pages(key)
+
+
+def hold_every_band(allocator, key=HOLD) -> None:
+    for band in allocator.members:
+        hold_band(band, key)
+
+
+def release_every_band(allocator, key=HOLD) -> None:
+    for band in allocator.members:
+        release_band(band, key)
 
 
 def setup_allocator_context():
